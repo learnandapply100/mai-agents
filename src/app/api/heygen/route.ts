@@ -1,41 +1,100 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
-export async function POST() {
-  const apiKey = process.env.HEYGEN_API_KEY;
+// TODO: Add LIVEAVATAR_API_KEY to your .env.local / Vercel project settings.
+// Get it from https://app.liveavatar.com/developers
+const LIVEAVATAR_API_KEY = process.env.LIVEAVATAR_API_KEY;
+const LIVEAVATAR_API_URL = "https://api.liveavatar.com";
 
-  if (!apiKey) {
+// TODO: Replace with the context_id from the "Sports Anchor Broadcast" context
+// you create at https://app.liveavatar.com/contexts
+const LIVEAVATAR_CONTEXT_ID = process.env.LIVEAVATAR_CONTEXT_ID;
+
+interface StartSessionRequestBody {
+  avatarId: string;
+  voiceId: string;
+  language?: string;
+}
+
+export async function POST(request: NextRequest) {
+  if (!LIVEAVATAR_API_KEY || LIVEAVATAR_API_KEY === "PLACEHOLDER_LIVEAVATAR_API_KEY") {
     return NextResponse.json(
-      { error: "HEYGEN_API_KEY not configured" },
+      { error: "LIVEAVATAR_API_KEY not configured" },
       { status: 500 }
     );
   }
 
+  let body: StartSessionRequestBody;
   try {
-    const response = await fetch(
-      "https://api.heygen.com/v1/streaming.create_token",
-      {
-        method: "POST",
-        headers: {
-          "x-api-key": apiKey,
-          "Content-Type": "application/json",
-        },
-      }
+    body = await request.json();
+  } catch {
+    return NextResponse.json(
+      { error: "Request body must include avatarId and voiceId" },
+      { status: 400 }
     );
+  }
+
+  const { avatarId, voiceId, language = "en" } = body;
+
+  if (!avatarId || !voiceId) {
+    return NextResponse.json(
+      { error: "avatarId and voiceId are required" },
+      { status: 400 }
+    );
+  }
+
+  try {
+    const response = await fetch(`${LIVEAVATAR_API_URL}/v1/sessions/token`, {
+      method: "POST",
+      headers: {
+        "X-API-KEY": LIVEAVATAR_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        mode: "FULL",
+        avatar_id: avatarId,
+        avatar_persona: {
+          voice_id: voiceId,
+          context_id: LIVEAVATAR_CONTEXT_ID,
+          language,
+        },
+        is_sandbox: false, // set to true while testing to avoid consuming credits
+      }),
+    });
 
     if (!response.ok) {
-      const error = await response.text();
-      return NextResponse.json(
-        { error: `HeyGen API error: ${error}` },
-        { status: response.status }
-      );
+      const contentType = response.headers.get("content-type");
+      let errorMessage = "Failed to retrieve session token";
+
+      if (contentType?.includes("application/json")) {
+        const errorBody = await response.json();
+        errorMessage =
+          errorBody?.data?.[0]?.message ??
+          errorBody?.message ??
+          errorBody?.error ??
+          errorMessage;
+      } else {
+        errorMessage = (await response.text()) || errorMessage;
+      }
+
+      return NextResponse.json({ error: errorMessage }, { status: response.status });
     }
 
     const data = await response.json();
-    return NextResponse.json({ token: data.data.token });
+    const sessionToken = data?.data?.session_token;
+    const sessionId = data?.data?.session_id;
+
+    if (!sessionToken) {
+      return NextResponse.json(
+        { error: "Failed to retrieve session token" },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ sessionToken, sessionId });
   } catch (error) {
-    console.error("Token generation error:", error);
+    console.error("LiveAvatar token generation error:", error);
     return NextResponse.json(
-      { error: "Failed to generate token" },
+      { error: "Failed to generate session token" },
       { status: 500 }
     );
   }
