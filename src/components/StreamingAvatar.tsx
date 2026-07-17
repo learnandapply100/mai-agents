@@ -1,12 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import StreamingAvatar, {
-  AvatarQuality,
-  StreamingEvents,
-  TaskType,
-  VoiceEmotion,
-} from "@heygen/streaming-avatar";
+import {
+  LiveAvatarSession,
+  SessionEvent,
+  AgentEventsEnum,
+} from "@heygen/liveavatar-web-sdk";
 
 // Chroma key function to remove green screen
 function applyChromaKey(
@@ -37,33 +36,55 @@ interface Match {
   name: string;
   sport: string;
   time: string;
+  // The Odds API's sport_key, needed to fetch real odds/analysis for this match.
+  // NOTE: "cricket" is a general key on The Odds API; confirm against
+  // GET /sports/ for your account tier if it doesn't return events.
+  sportKey: string;
 }
 
+// Ported from ANALYST_PERSONAS in sports_agent.py
+const ANALYST_PERSONAS: Record<string, string> = {
+  "ESPN Analyst":
+    "You are an ESPN sports analyst. Be enthusiastic, use sports metaphors, reference historical matchups, and give confident predictions with reasoning.",
+  "Vegas Sharp":
+    "You are a professional sports bettor. Focus on line movement, value opportunities, injury impacts, and bankroll management. Be analytical and probability-focused.",
+  "Statistical Guru":
+    "You are a sports statistician. Cite specific stats, use advanced metrics, discuss sample sizes, and express uncertainty appropriately.",
+  "Casual Fan":
+    "You are a casual sports fan explaining to a friend. Keep it simple, focus on storylines, star players, and make it fun.",
+  "Contrarian Analyst":
+    "You are a contrarian analyst. Look for reasons why the favorite might lose, find value in underdogs, and challenge conventional wisdom.",
+};
+
 // Separate avatar options (visual appearance)
+// NM 16/07/2026: Migrated to LiveAvatar IDs (obtained from https://app.liveavatar.com/avatars)
 const AVATARS: Record<string, { id: string; description: string }> = {
-  "Wayne (Male, Professional)": { id: "Wayne_20240711", description: "Professional male anchor" },
-  "Anna (Female, News)": { id: "Anna_public_3_20240108", description: "Female news reporter" },
-  "Josh (Male, Casual)": { id: "josh_lite3_20230714", description: "Friendly male host" },
-  "Tyler (Male, Suit)": { id: "Tyler-incasualsuit-20220721", description: "Professional in suit" },
-  "Kayla (Female, Casual)": { id: "Kayla-incasualsuit-20220818", description: "Casual female host" },
+  "Wayne (Male, Casual)": { id: "dd73ea75-1218-4ef3-92ce-606d5f7fbc0a", description: "Friendly male host" },
+  "Marianne (Female, News)": { id: "f86e8b45-3389-424a-b3d7-7f6e8729e36d", description: "Female news reporter" },
+  "Thaddeus (Male, Professional)": { id: "246e8d9d-5826-4f49-b8a0-07cb73ff7556", description: "Professional male anchor" },
+  "Anthony (Male, Suit)": { id: "38ad67ed-98f0-407c-a2d2-4f0998b306fc", description: "Professional in suit" },
+  "Anastasia (Female, Casual)": { id: "b4fc2d60-3b82-4694-b243-93e9d2bb0242", description: "Casual female host" },
 };
 
 // Separate voice options (audio)
-const VOICES: Record<string, { id: string; emotion: VoiceEmotion; description: string }> = {
-  "Male - Excited": { id: "1bd001e7e50f421d891986aad5158bc8", emotion: VoiceEmotion.EXCITED, description: "Energetic male voice" },
-  "Female - Broadcaster": { id: "2d5b0e6cf36f460aa7fc47e3eee4ba54", emotion: VoiceEmotion.BROADCASTER, description: "Professional female voice" },
-  "Male - Friendly": { id: "131a436c47064f708210df6628ef8f32", emotion: VoiceEmotion.FRIENDLY, description: "Warm male voice" },
-  "Male - Serious": { id: "1bd001e7e50f421d891986aad5158bc8", emotion: VoiceEmotion.SERIOUS, description: "Authoritative male voice" },
-  "Female - Soothing": { id: "2d5b0e6cf36f460aa7fc47e3eee4ba54", emotion: VoiceEmotion.SOOTHING, description: "Calm female voice" },
+// NM 16/07/2026: Migrated to LiveAvatar voice IDs (obtained from https://app.liveavatar.com/voices)
+// Note: LiveAvatar voices don't carry an "emotion" parameter the way the old
+// Streaming Avatar SDK did, so that field is dropped here.
+const VOICES: Record<string, { id: string; description: string }> = {
+  "Male - Excited": { id: "c2527536-6d1f-4412-a643-53a3497dada9", description: "Energetic male voice" },
+  "Female - Broadcaster": { id: "8a504f9b-95dd-42d4-8b0c-edc2567b6382", description: "Professional female voice" },
+  "Male - Friendly": { id: "83a26e3f-bcff-4887-80a2-17531c342c9e", description: "Warm male voice" },
+  "Male - Serious": { id: "c466083f-30f0-465b-a836-0b77abfe7956", description: "Authoritative male voice" },
+  "Female - Soothing": { id: "3607df3c-9de0-4274-b0be-7e035775ead5", description: "Calm female voice" },
 };
 
 // Sample matches - in production, fetch from Odds API
 const SAMPLE_MATCHES: Match[] = [
-  { id: "1", name: "Lakers vs Celtics", sport: "NBA", time: "Tonight 7:30 PM" },
-  { id: "2", name: "Chiefs vs Bills", sport: "NFL", time: "Sunday 4:25 PM" },
-  { id: "3", name: "Man City vs Liverpool", sport: "Premier League", time: "Saturday 12:30 PM" },
-  { id: "4", name: "Yankees vs Red Sox", sport: "MLB", time: "Tomorrow 7:05 PM" },
-  { id: "5", name: "India vs Australia", sport: "Cricket", time: "Friday 9:30 AM" },
+  { id: "1", name: "Lakers vs Celtics", sport: "NBA", time: "Tonight 7:30 PM", sportKey: "basketball_nba" },
+  { id: "2", name: "Chiefs vs Bills", sport: "NFL", time: "Sunday 4:25 PM", sportKey: "americanfootball_nfl" },
+  { id: "3", name: "Man City vs Liverpool", sport: "Premier League", time: "Saturday 12:30 PM", sportKey: "soccer_epl" },
+  { id: "4", name: "Yankees vs Red Sox", sport: "MLB", time: "Tomorrow 7:05 PM", sportKey: "baseball_mlb" },
+  { id: "5", name: "India vs Australia", sport: "Cricket", time: "Friday 9:30 AM", sportKey: "cricket" },
 ];
 
 export default function StreamingAvatarComponent() {
@@ -72,28 +93,80 @@ export default function StreamingAvatarComponent() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [selectedMatch, setSelectedMatch] = useState<Match>(SAMPLE_MATCHES[0]);
   const [scriptText, setScriptText] = useState("");
-  const [selectedAvatar, setSelectedAvatar] = useState("Wayne (Male, Professional)");
+  // NOTE: default must be a key that actually exists in the AVATARS/VOICES
+  // objects above — this broke silently after the ID migration last time.
+  const [selectedAvatar, setSelectedAvatar] = useState("Wayne (Male, Casual)");
   const [selectedVoice, setSelectedVoice] = useState("Male - Excited");
   const [error, setError] = useState<string | null>(null);
   const [debug, setDebug] = useState<string[]>([]);
   const [removeGreenScreen, setRemoveGreenScreen] = useState(true);
 
+  // AI analysis generation (odds + news + Groq, ported from sports_agent.py)
+  const [selectedPersona, setSelectedPersona] = useState("ESPN Analyst");
+  const [customPersona, setCustomPersona] = useState("");
+  const [isGeneratingAnalysis, setIsGeneratingAnalysis] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [analyzedGame, setAnalyzedGame] = useState<string | null>(null);
+  const [sources, setSources] = useState<string[]>([]);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const avatarRef = useRef<StreamingAvatar | null>(null);
+  const avatarRef = useRef<LiveAvatarSession | null>(null);
   const animationRef = useRef<number | null>(null);
 
-  // Generate script based on selected match
+  // Placeholder script shown before the user generates real AI analysis.
+  // NOTE: unlike before, changing the selected match no longer auto-rewrites
+  // scriptText — that's now the job of "Generate AI Analysis" below, so a
+  // generated script doesn't get silently clobbered by a match-selector change.
   useEffect(() => {
-    const match = selectedMatch;
     setScriptText(
-      `Welcome to AI Sports News! I'm bringing you the latest on tonight's big matchup. ` +
-      `The ${match.name} game is set for ${match.time}. ` +
-      `This ${match.sport} showdown promises to be an exciting one. ` +
-      `Both teams have been performing well this season, and fans are expecting a close contest. ` +
-      `Stay tuned for live updates and analysis right here on your AI Sports Channel.`
+      `Welcome to AI Sports News! Select a sport and click "Generate AI Analysis" ` +
+      `to have your anchor read a live, AI-generated breakdown of the latest odds and news — ` +
+      `or write your own script here.`
     );
-  }, [selectedMatch]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const generateAnalysis = async () => {
+    setIsGeneratingAnalysis(true);
+    setAnalysisError(null);
+    addDebug(`Generating analysis for ${selectedMatch.sportKey}...`);
+
+    try {
+      // Your AVATARS keys are like "Wayne (Male, Casual)" — strip the
+      // descriptor in parentheses so the LLM gets a clean name to introduce
+      // itself with, e.g. "Wayne".
+      const avatarName = selectedAvatar.split(" (")[0];
+
+      const response = await fetch("/api/analysis", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sportKey: selectedMatch.sportKey,
+          persona: selectedPersona,
+          customPersona,
+          avatarName,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to generate analysis");
+      }
+
+      setScriptText(data.script);
+      setAnalyzedGame(data.game);
+      setSources(data.sources ?? []);
+      addDebug(`Analysis generated for ${data.game}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Analysis generation failed";
+      setAnalysisError(message);
+      addDebug(`Analysis error: ${message}`);
+    } finally {
+      setIsGeneratingAnalysis(false);
+    }
+  };
 
   const addDebug = useCallback((msg: string) => {
     setDebug((prev) => [...prev.slice(-9), `${new Date().toLocaleTimeString()}: ${msg}`]);
@@ -137,14 +210,21 @@ export default function StreamingAvatarComponent() {
     };
   }, [isSessionActive, removeGreenScreen, renderChromaKey]);
 
-  const fetchAccessToken = async (): Promise<string> => {
-    const response = await fetch("/api/heygen", { method: "POST" });
+  const fetchAccessToken = async (
+    avatarId: string,
+    voiceId: string
+  ): Promise<string> => {
+    const response = await fetch("/api/heygen", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ avatarId, voiceId, language: "en" }),
+    });
     if (!response.ok) {
       const errorData = await response.json();
       throw new Error(errorData.error || "Failed to get access token");
     }
     const data = await response.json();
-    return data.token;
+    return data.sessionToken;
   };
 
   const startSession = async () => {
@@ -153,20 +233,23 @@ export default function StreamingAvatarComponent() {
     addDebug("Starting session...");
 
     try {
-      const token = await fetchAccessToken();
-      addDebug("Got access token");
-
-      const avatar = new StreamingAvatar({ token });
-      avatarRef.current = avatar;
-
       const avatarConfig = AVATARS[selectedAvatar];
       const voiceConfig = VOICES[selectedVoice];
 
-      // Set up event listeners
-      avatar.on(StreamingEvents.STREAM_READY, async (event) => {
+      const sessionToken = await fetchAccessToken(avatarConfig.id, voiceConfig.id);
+      addDebug("Got session token");
+
+      // voiceChat controls whether the SDK captures the viewer's microphone
+      // for two-way conversation. This app only pushes a pre-written script,
+      // so it's off by default — flip to true if you want viewers to be able
+      // to talk back to the anchor.
+      const session = new LiveAvatarSession(sessionToken, { voiceChat: false });
+      avatarRef.current = session;
+
+      session.on(SessionEvent.SESSION_STREAM_READY, () => {
         addDebug("Stream ready!");
-        if (videoRef.current && event.detail) {
-          videoRef.current.srcObject = event.detail;
+        if (videoRef.current) {
+          session.attach(videoRef.current);
           videoRef.current.play().catch(console.error);
         }
         setIsSessionActive(true);
@@ -177,10 +260,7 @@ export default function StreamingAvatarComponent() {
           if (avatarRef.current && scriptText.trim()) {
             addDebug("Auto-speaking script...");
             try {
-              await avatarRef.current.speak({
-                text: scriptText,
-                taskType: TaskType.REPEAT,
-              });
+              await avatarRef.current.repeat(scriptText);
               addDebug("Auto-speak started");
             } catch (err) {
               addDebug("Auto-speak failed");
@@ -189,38 +269,27 @@ export default function StreamingAvatarComponent() {
         }, 1000);
       });
 
-      avatar.on(StreamingEvents.STREAM_DISCONNECTED, () => {
-        addDebug("Stream disconnected");
+      session.on(SessionEvent.SESSION_DISCONNECTED, () => {
+        addDebug("Session disconnected");
         setIsSessionActive(false);
         if (videoRef.current) {
           videoRef.current.srcObject = null;
         }
       });
 
-      avatar.on(StreamingEvents.AVATAR_START_TALKING, () => {
+      session.on(AgentEventsEnum.AVATAR_SPEAK_STARTED, () => {
         addDebug("Avatar started talking");
         setIsSpeaking(true);
       });
 
-      avatar.on(StreamingEvents.AVATAR_STOP_TALKING, () => {
+      session.on(AgentEventsEnum.AVATAR_SPEAK_ENDED, () => {
         addDebug("Avatar stopped talking");
         setIsSpeaking(false);
       });
 
-      addDebug(`Creating session with avatar: ${avatarConfig.id}, voice: ${selectedVoice}`);
-
-      await avatar.createStartAvatar({
-        quality: AvatarQuality.High,
-        avatarName: avatarConfig.id,
-        voice: {
-          voiceId: voiceConfig.id,
-          rate: 1.0,
-          emotion: voiceConfig.emotion,
-        },
-        language: "en",
-      });
-
-      addDebug("Session created successfully");
+      addDebug(`Starting session with avatar: ${avatarConfig.id}, voice: ${voiceConfig.id}`);
+      await session.start();
+      addDebug("Session started successfully");
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
@@ -234,10 +303,7 @@ export default function StreamingAvatarComponent() {
 
     addDebug("Sending speech request...");
     try {
-      await avatarRef.current.speak({
-        text: scriptText,
-        taskType: TaskType.REPEAT,
-      });
+      await avatarRef.current.repeat(scriptText);
       addDebug("Speech request sent");
     } catch (err) {
       const message = err instanceof Error ? err.message : "Speech failed";
@@ -249,7 +315,7 @@ export default function StreamingAvatarComponent() {
   const stopSpeaking = async () => {
     if (!avatarRef.current) return;
     try {
-      await avatarRef.current.interrupt();
+      avatarRef.current.interrupt();
       addDebug("Interrupted speech");
     } catch (err) {
       addDebug("Interrupt failed");
@@ -261,9 +327,9 @@ export default function StreamingAvatarComponent() {
 
     addDebug("Ending session...");
     try {
-      await avatarRef.current.stopAvatar();
+      await avatarRef.current.stop();
     } catch (err) {
-      addDebug("Stop avatar error (may be normal)");
+      addDebug("Stop session error (may be normal)");
     }
 
     avatarRef.current = null;
@@ -278,7 +344,7 @@ export default function StreamingAvatarComponent() {
   useEffect(() => {
     return () => {
       if (avatarRef.current) {
-        avatarRef.current.stopAvatar().catch(console.error);
+        avatarRef.current.stop().catch(console.error);
       }
     };
   }, []);
@@ -292,7 +358,7 @@ export default function StreamingAvatarComponent() {
             AI Sports News Channel
           </h1>
           <p className="text-slate-400">
-            Powered by HeyGen Streaming Avatar | Modern AI Pro Workshop
+            Powered by HeyGen LiveAvatar | Modern AI Pro Workshop
           </p>
         </div>
 
@@ -386,7 +452,7 @@ export default function StreamingAvatarComponent() {
                   disabled={isSessionActive}
                   className="w-full bg-slate-700 text-white rounded-lg px-4 py-2 disabled:opacity-50"
                 >
-                  {Object.entries(AVATARS).map(([name, config]) => (
+                  {Object.entries(AVATARS).map(([name]) => (
                     <option key={name} value={name}>
                       {name}
                     </option>
@@ -406,7 +472,7 @@ export default function StreamingAvatarComponent() {
                   disabled={isSessionActive}
                   className="w-full bg-slate-700 text-white rounded-lg px-4 py-2 disabled:opacity-50"
                 >
-                  {Object.entries(VOICES).map(([name, config]) => (
+                  {Object.entries(VOICES).map(([name]) => (
                     <option key={name} value={name}>
                       {name}
                     </option>
@@ -456,6 +522,53 @@ export default function StreamingAvatarComponent() {
               Anchor Script
             </h2>
 
+            {/* Persona + AI generation controls */}
+            <div className="mb-4 space-y-3">
+              <div>
+                <label className="block text-sm text-slate-400 mb-2">
+                  AI Analyst Persona
+                </label>
+                <select
+                  value={selectedPersona}
+                  onChange={(e) => setSelectedPersona(e.target.value)}
+                  className="w-full bg-slate-700 text-white rounded-lg px-4 py-2"
+                >
+                  {Object.keys(ANALYST_PERSONAS).map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <textarea
+                value={customPersona}
+                onChange={(e) => setCustomPersona(e.target.value)}
+                placeholder="Or write a custom persona, e.g. 'You are a cricket expert focusing on IPL...'"
+                className="w-full h-16 bg-slate-700 text-white rounded-lg px-4 py-2 resize-none text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+              />
+
+              <button
+                onClick={generateAnalysis}
+                disabled={isGeneratingAnalysis}
+                className="w-full bg-purple-600 hover:bg-purple-700 disabled:bg-slate-600 text-white font-semibold py-3 px-6 rounded-lg transition-colors"
+              >
+                {isGeneratingAnalysis ? "Generating analysis..." : "🔍 Generate AI Analysis"}
+              </button>
+
+              {analysisError && (
+                <div className="bg-red-900/50 border border-red-500 text-red-200 rounded-lg p-3 text-sm">
+                  {analysisError}
+                </div>
+              )}
+
+              {analyzedGame && (
+                <p className="text-xs text-slate-400">
+                  Analyzing: <span className="text-slate-300">{analyzedGame}</span>
+                </p>
+              )}
+            </div>
+
             <textarea
               value={scriptText}
               onChange={(e) => setScriptText(e.target.value)}
@@ -491,6 +604,24 @@ export default function StreamingAvatarComponent() {
               </div>
             )}
 
+            {/* Source transparency, matching sports_agent.py's "see the raw data" philosophy */}
+            {sources.length > 0 && (
+              <div className="mt-6">
+                <h3 className="text-sm font-semibold text-slate-400 mb-2">
+                  News Sources Used
+                </h3>
+                <div className="bg-slate-900 rounded-lg p-3 text-xs text-slate-400 space-y-1">
+                  {sources.map((url, i) => (
+                    <div key={i} className="truncate">
+                      <a href={url} target="_blank" rel="noopener noreferrer" className="hover:text-blue-400">
+                        {url}
+                      </a>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Debug Log */}
             <div className="mt-6">
               <h3 className="text-sm font-semibold text-slate-400 mb-2">
@@ -510,7 +641,7 @@ export default function StreamingAvatarComponent() {
         {/* Footer */}
         <div className="mt-8 text-center text-slate-500 text-sm">
           <p>
-            Built for Modern AI Pro Workshop | Using HeyGen Streaming Avatar SDK
+            Built for Modern AI Pro Workshop | Using HeyGen LiveAvatar SDK
           </p>
         </div>
       </div>
