@@ -39,6 +39,7 @@ interface OddsBookmaker {
   markets: OddsMarket[];
 }
 interface OddsEvent {
+  id: string;
   home_team: string;
   away_team: string;
   commence_time: string;
@@ -51,7 +52,13 @@ interface TavilyResult {
   url?: string;
 }
 
-async function getOdds(sportKey: string): Promise<OddsEvent[]> {
+interface OddsResult {
+  events: OddsEvent[];
+  requestsRemaining: string | null;
+  requestsUsed: string | null;
+}
+
+async function getOdds(sportKey: string): Promise<OddsResult> {
   if (!ODDS_API_KEY || !ODDS_BASE_URL) {
     throw new Error("ODDS_API_KEY or ODDS_BASE_URL not configured");
   }
@@ -60,14 +67,24 @@ async function getOdds(sportKey: string): Promise<OddsEvent[]> {
   if (!response.ok) {
     throw new Error(`Odds API error: ${response.status} ${await response.text()}`);
   }
-  return response.json();
+  const events: OddsEvent[] = await response.json();
+  return {
+    events,
+    requestsRemaining: response.headers.get("x-requests-remaining"),
+    requestsUsed: response.headers.get("x-requests-used"),
+  };
 }
 
-async function getNews(query: string, maxResults = 8): Promise<TavilyResult[]> {
+interface NewsResult {
+  results: TavilyResult[];
+  creditsUsed: number | null;
+}
+
+async function getNews(query: string, maxResults = 8): Promise<NewsResult> {
   if (!TAVILY_API_KEY) {
     // Matches the Python fallback behavior loosely: if no Tavily key, just
     // proceed with no news rather than hard-failing the whole request.
-    return [];
+    return { results: [], creditsUsed: null };
   }
   const response = await fetch("https://api.tavily.com/search", {
     method: "POST",
@@ -77,18 +94,29 @@ async function getNews(query: string, maxResults = 8): Promise<TavilyResult[]> {
       query,
       max_results: maxResults,
       search_depth: "basic",
+      include_usage: true, // returns the real credit cost of this specific call
     }),
   });
   if (!response.ok) {
     // Non-fatal: analysis can still proceed on odds data alone.
     console.error("Tavily error:", await response.text());
-    return [];
+    return { results: [], creditsUsed: null };
   }
   const data = await response.json();
-  return data.results ?? [];
+  return {
+    results: data.results ?? [],
+    creditsUsed: data.usage?.credits ?? null,
+  };
 }
 
-async function analyzeWithLlm(prompt: string): Promise<string> {
+interface LlmResult {
+  content: string;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+}
+
+async function analyzeWithLlm(prompt: string): Promise<LlmResult> {
   if (!GROQ_API_KEY) {
     throw new Error("GROQ_API_KEY not configured");
   }
@@ -107,7 +135,12 @@ async function analyzeWithLlm(prompt: string): Promise<string> {
     throw new Error(`Groq API error: ${response.status} ${await response.text()}`);
   }
   const data = await response.json();
-  return data.choices?.[0]?.message?.content ?? "";
+  return {
+    content: data.choices?.[0]?.message?.content ?? "",
+    promptTokens: data.usage?.prompt_tokens ?? null,
+    completionTokens: data.usage?.completion_tokens ?? null,
+    totalTokens: data.usage?.total_tokens ?? null,
+  };
 }
 
 function buildOddsContext(event: OddsEvent): string {
@@ -128,6 +161,7 @@ function buildOddsContext(event: OddsEvent): string {
 
 interface AnalysisRequestBody {
   sportKey: string;
+  eventId?: string;
   persona: string;
   customPersona?: string;
   avatarName?: string;
@@ -141,29 +175,39 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const { sportKey, persona, customPersona, avatarName } = body;
+  const { sportKey, eventId, persona, customPersona, avatarName } = body;
   if (!sportKey) {
     return NextResponse.json({ error: "sportKey is required" }, { status: 400 });
   }
 
   try {
-    const events = await getOdds(sportKey);
-    const event = events.find((e) => e.bookmakers && e.bookmakers.length > 0);
+    const { events, requestsRemaining, requestsUsed } = await getOdds(sportKey);
+
+    // Prefer the exact game the user selected (by real Odds API event id,
+    // from /api/matches). Fall back to "first upcoming event with odds" only
+    // if no eventId was sent — e.g. older clients or direct API testing.
+    const event = eventId
+      ? events.find((e) => e.id === eventId)
+      : events.find((e) => e.bookmakers && e.bookmakers.length > 0);
 
     if (!event) {
       return NextResponse.json(
-        { error: "No upcoming games with odds found for this sport right now" },
+        {
+          error: eventId
+            ? "The selected game is no longer available — it may have started or odds may have changed. Try refreshing the match list."
+            : "No upcoming games with odds found for this sport right now",
+        },
         { status: 404 }
       );
     }
 
     const teams = `${event.away_team} ${event.home_team}`;
-    const news = await getNews(`${teams} game preview injury news`, 8);
+    const newsResult = await getNews(`${teams} game preview injury news`, 8);
 
-    const newsText = news
+    const newsText = newsResult.results
       .map((article) => `Title: ${article.title ?? ""}\nContent: ${article.content ?? ""}`)
       .join("\n\n");
-    const sources = news.map((article) => article.url).filter(Boolean) as string[];
+    const sources = newsResult.results.map((article) => article.url).filter(Boolean) as string[];
 
     const oddsContext = buildOddsContext(event);
     const activePersona =
@@ -199,13 +243,21 @@ ${
 }
 `;
 
-    const script = await analyzeWithLlm(prompt);
+    const llmResult = await analyzeWithLlm(prompt);
 
     return NextResponse.json({
-      script,
+      script: llmResult.content,
       game: `${event.away_team} @ ${event.home_team}`,
       commenceTime: event.commence_time,
       sources,
+      usage: {
+        oddsRequestsRemaining: requestsRemaining,
+        oddsRequestsUsed: requestsUsed,
+        promptTokens: llmResult.promptTokens,
+        completionTokens: llmResult.completionTokens,
+        totalTokens: llmResult.totalTokens,
+        tavilyCredits: newsResult.creditsUsed,
+      },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Analysis generation failed";

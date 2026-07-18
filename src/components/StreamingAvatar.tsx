@@ -40,6 +40,11 @@ interface Match {
   // NOTE: "cricket" is a general key on The Odds API; confirm against
   // GET /sports/ for your account tier if it doesn't return events.
   sportKey: string;
+  daysUntil: number;
+  // true when this is the next scheduled game but it's more than a week out
+  // (sport is between seasons/rounds) — shown clearly in the dropdown rather
+  // than implying the game is imminent.
+  isFarOut: boolean;
 }
 
 // Ported from ANALYST_PERSONAS in sports_agent.py
@@ -78,20 +83,31 @@ const VOICES: Record<string, { id: string; description: string }> = {
   "Female - Soothing": { id: "3607df3c-9de0-4274-b0be-7e035775ead5", description: "Calm female voice" },
 };
 
-// Sample matches - in production, fetch from Odds API
-const SAMPLE_MATCHES: Match[] = [
-  { id: "1", name: "Lakers vs Celtics", sport: "NBA", time: "Tonight 7:30 PM", sportKey: "basketball_nba" },
-  { id: "2", name: "Chiefs vs Bills", sport: "NFL", time: "Sunday 4:25 PM", sportKey: "americanfootball_nfl" },
-  { id: "3", name: "Man City vs Liverpool", sport: "Premier League", time: "Saturday 12:30 PM", sportKey: "soccer_epl" },
-  { id: "4", name: "Yankees vs Red Sox", sport: "MLB", time: "Tomorrow 7:05 PM", sportKey: "baseball_mlb" },
-  { id: "5", name: "India vs Australia", sport: "Cricket", time: "Friday 9:30 AM", sportKey: "cricket" },
+// Original hardcoded sample matches, kept for reference / rollback.
+// Replaced by a live fetch to /api/matches (see FALLBACK_MATCHES below and
+// the useEffect that populates `matches` on mount).
+// const SAMPLE_MATCHES: Match[] = [
+//   { id: "1", name: "Lakers vs Celtics", sport: "NBA", time: "Tonight 7:30 PM", sportKey: "basketball_nba", daysUntil: 0, isFarOut: false },
+//   { id: "2", name: "Chiefs vs Bills", sport: "NFL", time: "Sunday 4:25 PM", sportKey: "americanfootball_nfl", daysUntil: 3, isFarOut: false },
+//   { id: "3", name: "Man City vs Liverpool", sport: "Premier League", time: "Saturday 12:30 PM", sportKey: "soccer_epl", daysUntil: 1, isFarOut: false },
+//   { id: "4", name: "Yankees vs Red Sox", sport: "MLB", time: "Tomorrow 7:05 PM", sportKey: "baseball_mlb", daysUntil: 1, isFarOut: false },
+//   { id: "5", name: "India vs Australia", sport: "Cricket", time: "Friday 9:30 AM", sportKey: "cricket", daysUntil: 5, isFarOut: false },
+// ];
+
+// Shown only briefly while /api/matches is loading, or if that fetch fails —
+// real matches (from the live Odds API schedule) replace this on mount.
+const FALLBACK_MATCHES: Match[] = [
+  { id: "", name: "Loading live games...", sport: "—", time: "", sportKey: "basketball_nba", daysUntil: 0, isFarOut: false },
 ];
 
 export default function StreamingAvatarComponent() {
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [selectedMatch, setSelectedMatch] = useState<Match>(SAMPLE_MATCHES[0]);
+  const [matches, setMatches] = useState<Match[]>(FALLBACK_MATCHES);
+  const [isLoadingMatches, setIsLoadingMatches] = useState(true);
+  const [matchesError, setMatchesError] = useState<string | null>(null);
+  const [selectedMatch, setSelectedMatch] = useState<Match>(FALLBACK_MATCHES[0]);
   const [scriptText, setScriptText] = useState("");
   // NOTE: default must be a key that actually exists in the AVATARS/VOICES
   // objects above — this broke silently after the ID migration last time.
@@ -109,10 +125,69 @@ export default function StreamingAvatarComponent() {
   const [analyzedGame, setAnalyzedGame] = useState<string | null>(null);
   const [sources, setSources] = useState<string[]>([]);
 
+  // Usage / cost tracking. Odds API quota and Groq token counts are real
+  // numbers read from those APIs' own responses. LiveAvatar credits are an
+  // ESTIMATE only — the client SDK doesn't expose your actual credit balance,
+  // so this is derived from streamed session time (FULL mode = 1 credit per
+  // 30 sec), not a billed figure. Check app.liveavatar.com for real balance.
+  const [usage, setUsage] = useState({
+    groqCalls: 0,
+    totalTokens: 0,
+    oddsApiCalls: 0,
+    oddsRequestsRemaining: null as string | null,
+    oddsRequestsUsed: null as string | null,
+    tavilyCalls: 0,
+    tavilyCredits: 0,
+    liveAvatarSeconds: 0,
+    sessionsStarted: 0,
+  });
+  const sessionStartRef = useRef<number | null>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const avatarRef = useRef<LiveAvatarSession | null>(null);
   const animationRef = useRef<number | null>(null);
+
+  // Fetch real upcoming games (replaces the old hardcoded SAMPLE_MATCHES)
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const response = await fetch("/api/matches");
+        const data = await response.json();
+
+        if (!response.ok) throw new Error(data.error || "Failed to load games");
+        if (cancelled) return;
+
+        if (data.matches && data.matches.length > 0) {
+          setMatches(data.matches);
+          setSelectedMatch(data.matches[0]);
+        } else {
+          setMatchesError("No live games available right now for any tracked sport.");
+        }
+
+        if (data.usage) {
+          setUsage((prev) => ({
+            ...prev,
+            oddsApiCalls: prev.oddsApiCalls + (data.usage.oddsCallsThisRequest ?? 0),
+            oddsRequestsRemaining: data.usage.oddsRequestsRemaining ?? prev.oddsRequestsRemaining,
+            oddsRequestsUsed: data.usage.oddsRequestsUsed ?? prev.oddsRequestsUsed,
+          }));
+        }
+      } catch (err) {
+        if (cancelled) return;
+        const message = err instanceof Error ? err.message : "Failed to load games";
+        setMatchesError(message);
+      } finally {
+        if (!cancelled) setIsLoadingMatches(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Placeholder script shown before the user generates real AI analysis.
   // NOTE: unlike before, changing the selected match no longer auto-rewrites
@@ -143,6 +218,7 @@ export default function StreamingAvatarComponent() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           sportKey: selectedMatch.sportKey,
+          eventId: selectedMatch.id,
           persona: selectedPersona,
           customPersona,
           avatarName,
@@ -159,6 +235,19 @@ export default function StreamingAvatarComponent() {
       setAnalyzedGame(data.game);
       setSources(data.sources ?? []);
       addDebug(`Analysis generated for ${data.game}`);
+
+      if (data.usage) {
+        setUsage((prev) => ({
+          ...prev,
+          groqCalls: prev.groqCalls + 1,
+          totalTokens: prev.totalTokens + (data.usage.totalTokens ?? 0),
+          oddsApiCalls: prev.oddsApiCalls + 1,
+          oddsRequestsRemaining: data.usage.oddsRequestsRemaining ?? prev.oddsRequestsRemaining,
+          oddsRequestsUsed: data.usage.oddsRequestsUsed ?? prev.oddsRequestsUsed,
+          tavilyCalls: data.usage.tavilyCredits !== null ? prev.tavilyCalls + 1 : prev.tavilyCalls,
+          tavilyCredits: prev.tavilyCredits + (data.usage.tavilyCredits ?? 0),
+        }));
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Analysis generation failed";
       setAnalysisError(message);
@@ -255,6 +344,11 @@ export default function StreamingAvatarComponent() {
         setIsSessionActive(true);
         setIsLoading(false);
 
+        // Start the credit-estimate timer from when streaming actually
+        // begins (closest proxy we have to when LiveAvatar starts billing).
+        sessionStartRef.current = Date.now();
+        setUsage((prev) => ({ ...prev, sessionsStarted: prev.sessionsStarted + 1 }));
+
         // Auto-speak the script after a short delay
         setTimeout(async () => {
           if (avatarRef.current && scriptText.trim()) {
@@ -272,6 +366,7 @@ export default function StreamingAvatarComponent() {
       session.on(SessionEvent.SESSION_DISCONNECTED, () => {
         addDebug("Session disconnected");
         setIsSessionActive(false);
+        accumulateSessionDuration();
         if (videoRef.current) {
           videoRef.current.srcObject = null;
         }
@@ -297,6 +392,17 @@ export default function StreamingAvatarComponent() {
       setIsLoading(false);
     }
   };
+
+  // Accumulates elapsed streaming time into the credit estimate. Safe to call
+  // from both SESSION_DISCONNECTED and endSession() — sessionStartRef is
+  // cleared after the first call, so a second call is a no-op rather than
+  // double-counting.
+  const accumulateSessionDuration = useCallback(() => {
+    if (sessionStartRef.current === null) return;
+    const elapsedSeconds = (Date.now() - sessionStartRef.current) / 1000;
+    setUsage((prev) => ({ ...prev, liveAvatarSeconds: prev.liveAvatarSeconds + elapsedSeconds }));
+    sessionStartRef.current = null;
+  }, []);
 
   const speak = async () => {
     if (!avatarRef.current || !scriptText.trim()) return;
@@ -332,6 +438,7 @@ export default function StreamingAvatarComponent() {
       addDebug("Stop session error (may be normal)");
     }
 
+    accumulateSessionDuration();
     avatarRef.current = null;
     setIsSessionActive(false);
     setIsSpeaking(false);
@@ -423,22 +530,40 @@ export default function StreamingAvatarComponent() {
               {/* Match Selection */}
               <div>
                 <label className="block text-sm text-slate-400 mb-2">
-                  Select Match
+                  Select Match {isLoadingMatches && "(loading live games...)"}
                 </label>
                 <select
                   value={selectedMatch.id}
                   onChange={(e) => {
-                    const match = SAMPLE_MATCHES.find(m => m.id === e.target.value);
+                    const match = matches.find((m) => m.id === e.target.value);
                     if (match) setSelectedMatch(match);
                   }}
-                  className="w-full bg-slate-700 text-white rounded-lg px-4 py-2"
+                  disabled={isLoadingMatches || matches.length === 0}
+                  className="w-full bg-slate-700 text-white rounded-lg px-4 py-2 disabled:opacity-50"
                 >
-                  {SAMPLE_MATCHES.map((match) => (
+                  {matches.map((match) => (
                     <option key={match.id} value={match.id}>
                       {match.sport}: {match.name} - {match.time}
+                      {match.isFarOut ? ` ⚠ next scheduled game, ${match.daysUntil}d away — sport is between seasons/rounds right now` : ""}
                     </option>
                   ))}
                 </select>
+                {matchesError && (
+                  <p className="text-xs text-red-400 mt-1">{matchesError}</p>
+                )}
+                {selectedMatch.isFarOut && (
+                  <p className="text-xs text-amber-400 mt-1">
+                    ⚠ This is the next scheduled {selectedMatch.sport} game, but it&apos;s{" "}
+                    {selectedMatch.daysUntil} days away — the league is between
+                    seasons/rounds right now, so nothing sooner is available.
+                  </p>
+                )}
+                {!isLoadingMatches && matches.length > 0 && matches.length < 5 && (
+                  <p className="text-xs text-slate-500 mt-1">
+                    Showing {matches.length} of 5 tracked sports — the others have no
+                    live games with odds available right now.
+                  </p>
+                )}
               </div>
 
               {/* Avatar Selection (Visual) */}
@@ -512,6 +637,80 @@ export default function StreamingAvatarComponent() {
                     End Session
                   </button>
                 )}
+              </div>
+            </div>
+
+            {/* Usage & Cost tracking */}
+            <div className="mt-6 bg-slate-900 border border-slate-700 rounded-xl px-5 py-4">
+              <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wide mb-2">
+                Usage This Session
+              </h2>
+
+              <div className="bg-slate-800 border border-amber-500/30 rounded-lg px-3 py-2 mb-4">
+                <p className="text-sm text-slate-200 leading-snug">
+                  <span className="text-green-400 font-semibold">● Exact:</span>{" "}
+                  Odds API, Groq, and Tavily figures below are real numbers read
+                  directly from those APIs&apos; own responses.
+                </p>
+                <p className="text-sm text-slate-200 leading-snug mt-1">
+                  <span className="text-amber-400 font-semibold">● Estimate:</span>{" "}
+                  LiveAvatar sessions/credits are calculated from streamed time on
+                  this page — <strong>not</strong> your real billed balance. Check{" "}
+                  <a
+                    href="https://app.liveavatar.com"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline text-amber-300 hover:text-amber-200"
+                  >
+                    app.liveavatar.com
+                  </a>{" "}
+                  for your actual credit balance.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="bg-slate-800 rounded-lg p-3">
+                  <p className="text-xs text-slate-500">
+                    LiveAvatar Sessions <span className="text-amber-400">(est.)</span>
+                  </p>
+                  <p className="text-xl font-semibold text-white">{usage.sessionsStarted}</p>
+                </div>
+                <div className="bg-slate-800 rounded-lg p-3">
+                  <p className="text-xs text-slate-500">
+                    Streamed Time <span className="text-amber-400">(est.)</span>
+                  </p>
+                  <p className="text-xl font-semibold text-white">
+                    {Math.round(usage.liveAvatarSeconds)}s
+                  </p>
+                  <p className="text-xs text-slate-500">
+                    ≈ {Math.ceil(usage.liveAvatarSeconds / 30)} credits (FULL mode)
+                  </p>
+                </div>
+                <div className="bg-slate-800 rounded-lg p-3">
+                  <p className="text-xs text-slate-500">
+                    AI Analyses <span className="text-green-400">(exact)</span>
+                  </p>
+                  <p className="text-xl font-semibold text-white">{usage.groqCalls}</p>
+                  <p className="text-xs text-slate-500">{usage.totalTokens.toLocaleString()} tokens total</p>
+                </div>
+                <div className="bg-slate-800 rounded-lg p-3">
+                  <p className="text-xs text-slate-500">
+                    Odds API Calls <span className="text-green-400">(exact)</span>
+                  </p>
+                  <p className="text-xl font-semibold text-white">{usage.oddsApiCalls}</p>
+                  <p className="text-xs text-slate-500">
+                    {usage.oddsRequestsUsed !== null
+                      ? `${usage.oddsRequestsUsed} used / ${usage.oddsRequestsRemaining} left`
+                      : "quota unknown yet"}
+                  </p>
+                </div>
+                <div className="bg-slate-800 rounded-lg p-3 col-span-2">
+                  <p className="text-xs text-slate-500">
+                    Tavily Searches <span className="text-green-400">(exact)</span>
+                  </p>
+                  <p className="text-xl font-semibold text-white">{usage.tavilyCalls}</p>
+                  <p className="text-xs text-slate-500">{usage.tavilyCredits} credits used</p>
+                </div>
               </div>
             </div>
           </div>
