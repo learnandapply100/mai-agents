@@ -138,10 +138,12 @@ export default function StreamingAvatarComponent() {
     oddsRequestsUsed: null as string | null,
     tavilyCalls: 0,
     tavilyCredits: 0,
-    liveAvatarSeconds: 0,
+    liveAvatarSeconds: 0, // total streamed time, informational only — NOT used for credit math
+    estimatedCredits: 0, // real credit estimate, computed per-session below
     sessionsStarted: 0,
   });
   const sessionStartRef = useRef<number | null>(null);
+  const sessionIsSandboxRef = useRef<boolean>(true);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -195,8 +197,8 @@ export default function StreamingAvatarComponent() {
   // generated script doesn't get silently clobbered by a match-selector change.
   useEffect(() => {
     setScriptText(
-      `Welcome to AI Sports News! Select a sport and click "Generate AI Analysis" ` +
-      `to have your anchor read a live, AI-generated breakdown of the latest odds and news — ` +
+      `Welcome to Gen AI Sports News! Select a sport and click "Generate AI Analysis" ` +
+      `to have your anchor read a live, Gen AI-generated breakdown of the latest odds and news — ` +
       `or write your own script here.`
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -302,7 +304,7 @@ export default function StreamingAvatarComponent() {
   const fetchAccessToken = async (
     avatarId: string,
     voiceId: string
-  ): Promise<string> => {
+  ): Promise<{ sessionToken: string; isSandbox: boolean }> => {
     const response = await fetch("/api/heygen", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -313,7 +315,7 @@ export default function StreamingAvatarComponent() {
       throw new Error(errorData.error || "Failed to get access token");
     }
     const data = await response.json();
-    return data.sessionToken;
+    return { sessionToken: data.sessionToken, isSandbox: data.isSandbox ?? true };
   };
 
   const startSession = async () => {
@@ -325,8 +327,9 @@ export default function StreamingAvatarComponent() {
       const avatarConfig = AVATARS[selectedAvatar];
       const voiceConfig = VOICES[selectedVoice];
 
-      const sessionToken = await fetchAccessToken(avatarConfig.id, voiceConfig.id);
-      addDebug("Got session token");
+      const { sessionToken, isSandbox } = await fetchAccessToken(avatarConfig.id, voiceConfig.id);
+      sessionIsSandboxRef.current = isSandbox;
+      addDebug(`Got session token${isSandbox ? " (sandbox — free)" : " (real — consumes credits)"}`);
 
       // voiceChat controls whether the SDK captures the viewer's microphone
       // for two-way conversation. This app only pushes a pre-written script,
@@ -393,14 +396,33 @@ export default function StreamingAvatarComponent() {
     }
   };
 
-  // Accumulates elapsed streaming time into the credit estimate. Safe to call
-  // from both SESSION_DISCONNECTED and endSession() — sessionStartRef is
-  // cleared after the first call, so a second call is a no-op rather than
-  // double-counting.
+  // Accumulates elapsed streaming time AND credit estimate into usage state.
+  // Safe to call from both SESSION_DISCONNECTED and endSession() —
+  // sessionStartRef is cleared after the first call, so a second call is a
+  // no-op rather than double-counting.
+  //
+  // IMPORTANT: credits are computed PER SESSION, right here, not by pooling
+  // total seconds across all sessions and dividing once at the end. Real
+  // usage data confirmed billing works this way — e.g. five separate 5-second
+  // sessions cost 5 credits (1 each, rounded up), not
+  // ceil(25 total seconds / 30) = 1. Pooling first would have undercounted.
+  //
+  // Sandbox sessions are excluded from the credit count entirely — confirmed
+  // from real usage data that sandbox sessions cost 0 credits regardless of
+  // duration, up to their own separate ~1-2 min cap.
   const accumulateSessionDuration = useCallback(() => {
     if (sessionStartRef.current === null) return;
     const elapsedSeconds = (Date.now() - sessionStartRef.current) / 1000;
-    setUsage((prev) => ({ ...prev, liveAvatarSeconds: prev.liveAvatarSeconds + elapsedSeconds }));
+    const wasSandbox = sessionIsSandboxRef.current;
+    // Every real (non-sandbox) session costs at least 1 credit, even if it
+    // lasted only a few seconds — confirmed directly from usage.csv (4s and
+    // 9s sessions each cost exactly 1 credit, same as longer ones under 30s).
+    const sessionCredits = wasSandbox ? 0 : Math.max(1, Math.ceil(elapsedSeconds / 30));
+    setUsage((prev) => ({
+      ...prev,
+      liveAvatarSeconds: prev.liveAvatarSeconds + elapsedSeconds,
+      estimatedCredits: prev.estimatedCredits + sessionCredits,
+    }));
     sessionStartRef.current = null;
   }, []);
 
@@ -462,7 +484,7 @@ export default function StreamingAvatarComponent() {
         {/* Header */}
         <div className="text-center mb-8">
           <h1 className="text-4xl font-bold text-white mb-2">
-            AI Sports News Channel
+            Gen AI Sports News Channel
           </h1>
           <p className="text-slate-400">
             Powered by HeyGen LiveAvatar | Modern AI Pro Workshop
@@ -496,7 +518,7 @@ export default function StreamingAvatarComponent() {
                 <div className="absolute inset-0 flex items-center justify-center">
                   <div className="text-center text-slate-400">
                     <div className="text-6xl mb-4">🎬</div>
-                    <p>Start a session to see your AI anchor</p>
+                    <p>Start a session to see your Gen AI anchor</p>
                   </div>
                 </div>
               )}
@@ -683,7 +705,7 @@ export default function StreamingAvatarComponent() {
                     {Math.round(usage.liveAvatarSeconds)}s
                   </p>
                   <p className="text-xs text-slate-500">
-                    ≈ {Math.ceil(usage.liveAvatarSeconds / 30)} credits (FULL mode)
+                    ≈ {usage.estimatedCredits} credits (FULL mode, per-session)
                   </p>
                 </div>
                 <div className="bg-slate-800 rounded-lg p-3">
@@ -725,7 +747,7 @@ export default function StreamingAvatarComponent() {
             <div className="mb-4 space-y-3">
               <div>
                 <label className="block text-sm text-slate-400 mb-2">
-                  AI Analyst Persona
+                  Gen AI Analyst Persona
                 </label>
                 <select
                   value={selectedPersona}
@@ -752,7 +774,7 @@ export default function StreamingAvatarComponent() {
                 disabled={isGeneratingAnalysis}
                 className="w-full bg-purple-600 hover:bg-purple-700 disabled:bg-slate-600 text-white font-semibold py-3 px-6 rounded-lg transition-colors"
               >
-                {isGeneratingAnalysis ? "Generating analysis..." : "🔍 Generate AI Analysis"}
+                {isGeneratingAnalysis ? "Generating analysis..." : "🔍 Generate Gen AI Analysis"}
               </button>
 
               {analysisError && (
@@ -771,7 +793,7 @@ export default function StreamingAvatarComponent() {
             <textarea
               value={scriptText}
               onChange={(e) => setScriptText(e.target.value)}
-              placeholder="Enter the script for your AI anchor to read..."
+              placeholder="Enter the script for your Gen AI anchor to read..."
               className="w-full h-48 bg-slate-700 text-white rounded-lg px-4 py-3 resize-none focus:ring-2 focus:ring-blue-500 focus:outline-none"
             />
 

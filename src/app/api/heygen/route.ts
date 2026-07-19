@@ -2,12 +2,17 @@ import { NextRequest, NextResponse } from "next/server";
 
 // TODO: Add LIVEAVATAR_API_KEY to your .env.local / Vercel project settings.
 // Get it from https://app.liveavatar.com/developers
-const LIVEAVATAR_API_KEY = process.env.LIVEAVATAR_API_KEY;
+const LIVEAVATAR_API_KEY = process.env.LIVEAVATAR_API_KEY ?? "PLACEHOLDER_LIVEAVATAR_API_KEY";
 const LIVEAVATAR_API_URL = "https://api.liveavatar.com";
 
 // TODO: Replace with the context_id from the "Sports Anchor Broadcast" context
 // you create at https://app.liveavatar.com/contexts
-const LIVEAVATAR_CONTEXT_ID = process.env.LIVEAVATAR_CONTEXT_ID;
+const LIVEAVATAR_CONTEXT_ID = process.env.LIVEAVATAR_CONTEXT_ID ?? "PLACEHOLDER_CONTEXT_ID";
+
+// Defaults to sandboxed (safe) unless explicitly set to "false" in env vars.
+// Given how easily a single accidental "Start Session" click can burn a real
+// credit, this should never silently default to spending real credits.
+const IS_SANDBOX = process.env.LIVEAVATAR_SANDBOX !== "false";
 
 interface StartSessionRequestBody {
   avatarId: string;
@@ -57,7 +62,7 @@ export async function POST(request: NextRequest) {
           context_id: LIVEAVATAR_CONTEXT_ID,
           language,
         },
-        is_sandbox: false, // set to true while testing to avoid consuming credits
+        is_sandbox: IS_SANDBOX,
       }),
     });
 
@@ -90,7 +95,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    return NextResponse.json({ sessionToken, sessionId });
+    return NextResponse.json({ sessionToken, sessionId, isSandbox: IS_SANDBOX });
   } catch (error) {
     console.error("LiveAvatar token generation error:", error);
     return NextResponse.json(
